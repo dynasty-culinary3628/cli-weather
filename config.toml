@@ -1,0 +1,15 @@
+# cli-weather configuration
+# Edit this file to customize your weather display.
+
+# Your US ZIP code (required)
+zip_code = "28681"
+
+# Units: "imperial" (°F, mph, inHg, mi) or "metric" (°C, km/h, hPa, km)
+units = "imperial"
+
+# How often to refresh weather data, in minutes.
+# The weather.gov API updates observations hourly; 10 minutes is reasonable.
+refresh_minutes = 10
+
+# Identifies your app to the weather.gov API (required by their terms of service).
+user_agent = "cli-weather/1.0 (github.com/user/cli-weather)"
