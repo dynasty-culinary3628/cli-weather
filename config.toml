@@ -2,7 +2,7 @@
 # Edit this file to customize your weather display.
 
 # Your US ZIP code (required)
-zip_code = "28681"
+zip_code = "10010"
 
 # Units: "imperial" (°F, mph, inHg, mi) or "metric" (°C, km/h, hPa, km)
 units = "imperial"
@@ -12,4 +12,4 @@ units = "imperial"
 refresh_minutes = 10
 
 # Identifies your app to the weather.gov API (required by their terms of service).
-user_agent = "cli-weather/1.0 (github.com/user/cli-weather)"
+user_agent = "cli-weather/1.0 (github.com/dynasty-culinary3628/cli-weather)"
