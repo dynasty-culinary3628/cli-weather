@@ -65,6 +65,10 @@ var (
 	visStyle = lipgloss.NewStyle().
 			Foreground(clrFrost2)
 
+	hainesLowStyle  = lipgloss.NewStyle().Foreground(clrAurora4) // green — low
+	hainesMidStyle  = lipgloss.NewStyle().Foreground(clrAurora3) // yellow — moderate
+	hainesHighStyle = lipgloss.NewStyle().Foreground(clrAurora1) // red — high
+
 	alertStyle = lipgloss.NewStyle().
 			Background(clrAurora1).
 			Foreground(clrSnow1).
@@ -87,10 +91,6 @@ var (
 			Foreground(clrAurora1).
 			Bold(true)
 )
-
-// minRefreshInterval is the shortest time allowed between manual meta-r refreshes.
-// weather.gov has no published rate limit; 1 minute is a reasonable courtesy floor.
-const minRefreshInterval = time.Minute
 
 // ── Messages ─────────────────────────────────────────────────────────────────
 
@@ -131,6 +131,8 @@ type model struct {
 	width        int
 	height       int
 	hourlyOffset int // horizontal scroll offset for hourly forecast
+	alertOffset  int // vertical scroll offset for alerts panel
+	refreshErr   string // non-empty when a background refresh failed
 
 	spinner spinner.Model
 }
@@ -220,18 +222,20 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.loading = "Refreshing…"
 				return m, tea.Batch(m.spinner.Tick, m.cmdFetchWeather())
 			}
-		case "alt+r":
-			if m.stage == stageDone && time.Since(m.data.FetchedAt) >= minRefreshInterval {
-				m.stage = stageWeather
-				m.loading = "Refreshing…"
-				return m, tea.Batch(m.spinner.Tick, m.cmdFetchWeather())
-			}
-		case "left", "h":
+case "left", "h":
 			if m.hourlyOffset > 0 {
 				m.hourlyOffset--
 			}
 		case "right", "l":
 			m.hourlyOffset++
+		case "up", "k":
+			if m.alertOffset > 0 {
+				m.alertOffset--
+			}
+		case "down", "j":
+			if len(m.data.Alerts) > 0 {
+				m.alertOffset++
+			}
 		}
 
 	case spinner.TickMsg:
@@ -253,6 +257,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case weatherMsg:
 		m.data = WeatherData(msg)
+		m.gp.NWRFrequency = m.data.GridPoint.NWRFrequency
+		m.alertOffset = 0
+		m.refreshErr = ""
 		m.stage = stageDone
 		return m, m.cmdScheduleRefresh()
 
@@ -262,6 +269,13 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, tea.Batch(m.spinner.Tick, m.cmdFetchWeather())
 
 	case errMsg:
+		// If we already have data, keep showing it and note the error.
+		// Only go to the fatal error screen on initial load failure.
+		if !m.data.FetchedAt.IsZero() {
+			m.refreshErr = msg.err.Error()
+			m.stage = stageDone
+			return m, m.cmdScheduleRefresh()
+		}
 		m.stage = stageError
 		m.err = msg.err
 	}
@@ -321,22 +335,35 @@ func (m model) viewReady() string {
 	const helpLines = 1
 	const statusLines = 1
 
+	errNoticeLines := 0
+	if m.refreshErr != "" {
+		errNoticeLines = 1
+	}
+
 	alertLines := 0
 	if len(m.data.Alerts) > 0 {
-		alertLines = 2
+		// 4 lines of header/meta per alert + up to 6 lines of description/instructions + border/padding
+		alertLines = len(m.data.Alerts)*10 + 2
+		if alertLines > 20 {
+			alertLines = 20
+		}
 	}
 	hourlyLines := 4
 	zoneLines := 0
 	if len(m.data.ZoneForecast) > 0 {
 		zoneLines = 7
 	}
-	mainHeight := m.height - statusLines - hourlyLines - zoneLines - alertLines - helpLines
+	mainHeight := m.height - statusLines - errNoticeLines - hourlyLines - zoneLines - alertLines - helpLines
 	if mainHeight < 4 {
 		mainHeight = 4
 	}
 
 	var sections []string
 	sections = append(sections, m.renderStatusBar())
+	if m.refreshErr != "" {
+		notice := "⚠ Refresh failed: " + m.refreshErr
+		sections = append(sections, errorStyle.Width(m.width).Render(notice))
+	}
 
 	// Two-column layout at >= 110 cols, single column otherwise.
 	if m.width >= 110 {
@@ -358,7 +385,7 @@ func (m model) viewReady() string {
 	}
 
 	if alertLines > 0 {
-		sections = append(sections, m.renderAlerts(m.width))
+		sections = append(sections, m.renderAlerts(m.width, alertLines))
 	}
 
 	sections = append(sections, m.renderHelp())
@@ -513,12 +540,45 @@ func (m model) renderConditions(width, height int) string {
 		lines = append(lines, row("👁", "Visibility", visStyle.Render(visStr)))
 	}
 
+	// Haines Index (fire weather)
+	if m.data.HainesIndex != nil {
+		hi := *m.data.HainesIndex
+		var label string
+		var style lipgloss.Style
+		switch {
+		case hi <= 3:
+			label = "Very Low"
+			style = hainesLowStyle
+		case hi == 4:
+			label = "Low"
+			style = hainesLowStyle
+		case hi == 5:
+			label = "Moderate"
+			style = hainesMidStyle
+		default:
+			label = "High"
+			style = hainesHighStyle
+		}
+		hiStr := fmt.Sprintf("%d (%s)", hi, label)
+		lines = append(lines, row("🔥", "Haines Idx", style.Render(hiStr)))
+	}
+
 	lines = append(lines, "")
 	if obs.StationName != "" {
 		lines = append(lines, mutedStyle.Render("Station: "+obs.StationName))
 	}
 	if !obs.Timestamp.IsZero() {
 		lines = append(lines, mutedStyle.Render("As of: "+obs.Timestamp.In(tz).Format("3:04 PM")))
+	}
+	if m.gp.NWRTransmitter != "" {
+		nwrStr := "NWR: " + m.gp.NWRTransmitter
+		if m.gp.NWRFrequency != "" {
+			nwrStr += " " + m.gp.NWRFrequency + " MHz"
+		}
+		if m.gp.NWRSameCode != "" {
+			nwrStr += "  SAME: " + m.gp.NWRSameCode
+		}
+		lines = append(lines, mutedStyle.Render(nwrStr))
 	}
 
 	innerW := width - 4 // 2 for border, 2 for padding
@@ -683,31 +743,125 @@ func (m model) renderZoneForecast(width, height int) string {
 		Render(content)
 }
 
-func (m model) renderAlerts(width int) string {
-	var parts []string
-	for _, a := range m.data.Alerts {
-		var style lipgloss.Style
+func (m model) renderAlerts(width, height int) string {
+	innerW := width - 6 // border + padding
+	if innerW < 10 {
+		innerW = 10
+	}
+
+	tz, _ := time.LoadLocation(m.gp.TimeZone)
+	if tz == nil {
+		tz = time.Local
+	}
+
+	// Build all content lines across all alerts.
+	var allLines []string
+	for i, a := range m.data.Alerts {
+		if i > 0 {
+			allLines = append(allLines, "")
+		}
+
+		var headerStyle lipgloss.Style
 		switch strings.ToLower(a.Severity) {
 		case "extreme", "severe":
-			style = alertStyle
+			headerStyle = alertStyle
 		default:
-			style = alertWarnStyle
+			headerStyle = alertWarnStyle
 		}
-		headline := a.Headline
-		if headline == "" {
-			headline = a.Event
+
+		// Header: event + severity + urgency
+		urgency := ""
+		if a.Urgency != "" {
+			urgency = "  Urgency: " + a.Urgency
 		}
-		maxLen := width - 4
-		if len(headline) > maxLen {
-			headline = headline[:maxLen]
+		allLines = append(allLines, headerStyle.Render("⚠ "+a.Event)+"  "+
+			labelStyle.Render("Severity: "+a.Severity+urgency))
+
+		// Issuer + timing
+		meta := ""
+		if a.SenderName != "" {
+			meta = a.SenderName
 		}
-		parts = append(parts, style.Render("⚠ "+headline))
+		if !a.Onset.IsZero() {
+			meta += "  From: " + a.Onset.In(tz).Format("Mon 3:04 PM")
+		}
+		if !a.Expires.IsZero() {
+			meta += "  Until: " + a.Expires.In(tz).Format("Mon 3:04 PM")
+		}
+		if meta != "" {
+			allLines = append(allLines, mutedStyle.Render(meta))
+		}
+
+		// Affected areas
+		if a.AreaDesc != "" {
+			for _, l := range wordWrap("Area: "+a.AreaDesc, innerW) {
+				allLines = append(allLines, valueStyle.Render(l))
+			}
+		}
+
+		// Description
+		if a.Description != "" {
+			allLines = append(allLines, "")
+			allLines = append(allLines, labelStyle.Render("Details:"))
+			for _, l := range wordWrap(strings.ReplaceAll(a.Description, "\n", " "), innerW) {
+				allLines = append(allLines, valueStyle.Render(l))
+			}
+		}
+
+		// Instructions
+		if a.Instruction != "" {
+			allLines = append(allLines, "")
+			allLines = append(allLines, labelStyle.Render("Instructions:"))
+			for _, l := range wordWrap(strings.ReplaceAll(a.Instruction, "\n", " "), innerW) {
+				allLines = append(allLines, valueStyle.Render(l))
+			}
+		}
 	}
-	return strings.Join(parts, "\n")
+
+	// Apply scroll offset.
+	visibleLines := height - 2 // subtract border rows
+	if visibleLines < 1 {
+		visibleLines = 1
+	}
+
+	maxOffset := len(allLines) - visibleLines
+	if maxOffset < 0 {
+		maxOffset = 0
+	}
+	offset := m.alertOffset
+	if offset > maxOffset {
+		offset = maxOffset
+	}
+
+	end := offset + visibleLines
+	if end > len(allLines) {
+		end = len(allLines)
+	}
+	visible := allLines[offset:end]
+
+	// Scroll indicators on the last line.
+	scrollIndicator := ""
+	if offset > 0 && end < len(allLines) {
+		scrollIndicator = mutedStyle.Render("▲▼ scroll")
+	} else if offset > 0 {
+		scrollIndicator = mutedStyle.Render("▲ scroll")
+	} else if end < len(allLines) {
+		scrollIndicator = mutedStyle.Render("▼ scroll")
+	}
+	if scrollIndicator != "" && len(visible) > 0 {
+		visible[len(visible)-1] = scrollIndicator
+	}
+
+	content := strings.Join(visible, "\n")
+	return panelStyle.
+		Width(width - 2).
+		Height(height - 2).
+		Padding(0, 1).
+		Render(content)
 }
 
 func (m model) renderHelp() string {
-	keys := "[q] quit  [r] refresh  [⌥r] refresh (rate-limited)  [←/→] scroll hourly"
+	keys := "[q] quit  [r] refresh  [←/→] scroll hourly  [↑/↓] scroll alerts"
 	return helpStyle.Width(m.width).Render(keys)
 }
 

@@ -51,12 +51,14 @@ func loadConfig() (Config, string, error) {
 	return cfg, path, nil
 }
 
-// configFilePath returns the config file path, preferring a local config.toml
-// over the OS config directory.
+// configFilePath returns the config file path, preferring a config.toml in the
+// same directory as the binary over the OS config directory.
 func configFilePath() (string, error) {
-	if _, err := os.Stat("config.toml"); err == nil {
-		abs, _ := filepath.Abs("config.toml")
-		return abs, nil
+	if exe, err := os.Executable(); err == nil {
+		local := filepath.Join(filepath.Dir(exe), "config.toml")
+		if _, err := os.Stat(local); err == nil {
+			return local, nil
+		}
 	}
 
 	dir, err := os.UserConfigDir()

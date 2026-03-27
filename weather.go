@@ -6,6 +6,7 @@ import (
 	"io"
 	"math"
 	"net/http"
+	"regexp"
 	"strings"
 	"time"
 )
@@ -89,6 +90,9 @@ type GridPoint struct {
 	ForecastZoneURL   string // e.g. https://api.weather.gov/zones/forecast/NYZ072
 	TimeZone          string
 	City, State       string
+	NWRTransmitter    string // NOAA Weather Radio call sign, e.g. KJY85
+	NWRSameCode       string // SAME code for NWR alerts, e.g. 037003
+	NWRFrequency      string // broadcast frequency, e.g. 162.525
 }
 
 // ZoneForecastPeriod is one named period in the NWS zone text forecast.
@@ -129,10 +133,16 @@ type Observation struct {
 
 // Alert is an active NWS weather alert.
 type Alert struct {
-	Event    string
-	Headline string
-	Severity string
-	Expires  time.Time
+	Event       string
+	Headline    string
+	Severity    string
+	Urgency     string
+	AreaDesc    string
+	Description string
+	Instruction string
+	SenderName  string
+	Onset       time.Time
+	Expires     time.Time
 }
 
 // WeatherData holds all fetched weather data for display.
@@ -144,6 +154,7 @@ type WeatherData struct {
 	Hourly       []ForecastPeriod
 	Alerts       []Alert
 	ZoneForecast []ZoneForecastPeriod
+	HainesIndex  *int
 	FetchedAt    time.Time
 }
 
@@ -255,6 +266,10 @@ func (c *Client) GridPointFromLatLon(lat, lon float64) (GridPoint, error) {
 					State string `json:"state"`
 				} `json:"properties"`
 			} `json:"relativeLocation"`
+			NWR struct {
+				Transmitter string `json:"transmitter"`
+				SameCode    string `json:"sameCode"`
+			} `json:"nwr"`
 		} `json:"properties"`
 	}
 
@@ -274,6 +289,8 @@ func (c *Client) GridPointFromLatLon(lat, lon float64) (GridPoint, error) {
 		TimeZone:          p.TimeZone,
 		City:              p.RelativeLocation.Properties.City,
 		State:             p.RelativeLocation.Properties.State,
+		NWRTransmitter:    p.NWR.Transmitter,
+		NWRSameCode:       p.NWR.SameCode,
 	}, nil
 }
 
@@ -387,10 +404,16 @@ func (c *Client) ActiveAlerts(lat, lon float64) ([]Alert, error) {
 	var r struct {
 		Features []struct {
 			Properties struct {
-				Event    string `json:"event"`
-				Headline string `json:"headline"`
-				Severity string `json:"severity"`
-				Expires  string `json:"expires"`
+				Event       string `json:"event"`
+				Headline    string `json:"headline"`
+				Severity    string `json:"severity"`
+				Urgency     string `json:"urgency"`
+				AreaDesc    string `json:"areaDesc"`
+				Description string `json:"description"`
+				Instruction string `json:"instruction"`
+				SenderName  string `json:"senderName"`
+				Onset       string `json:"onset"`
+				Expires     string `json:"expires"`
 			} `json:"properties"`
 		} `json:"features"`
 	}
@@ -400,12 +423,19 @@ func (c *Client) ActiveAlerts(lat, lon float64) ([]Alert, error) {
 
 	out := make([]Alert, 0, len(r.Features))
 	for _, f := range r.Features {
+		p := f.Properties
 		a := Alert{
-			Event:    f.Properties.Event,
-			Headline: f.Properties.Headline,
-			Severity: f.Properties.Severity,
+			Event:       p.Event,
+			Headline:    p.Headline,
+			Severity:    p.Severity,
+			Urgency:     p.Urgency,
+			AreaDesc:    p.AreaDesc,
+			Description: p.Description,
+			Instruction: p.Instruction,
+			SenderName:  p.SenderName,
 		}
-		a.Expires, _ = time.Parse(time.RFC3339, f.Properties.Expires)
+		a.Onset, _ = time.Parse(time.RFC3339, p.Onset)
+		a.Expires, _ = time.Parse(time.RFC3339, p.Expires)
 		out = append(out, a)
 	}
 	return out, nil
@@ -439,6 +469,126 @@ func (c *Client) ZoneForecastText(zoneURL string) ([]ZoneForecastPeriod, error) 
 	return out, nil
 }
 
+var nwrFreqRe = regexp.MustCompile(`'transmitter':\s*'(162\.\d+)'`)
+
+// NWRFrequency fetches the broadcast frequency for a NWR transmitter call sign.
+// It parses the frequency from the SSML response returned by the NWS radio endpoint.
+func (c *Client) NWRFrequency(callSign string) (string, error) {
+	if callSign == "" {
+		return "", nil
+	}
+	req, err := http.NewRequest("GET", "https://api.weather.gov/radio/"+callSign+"/broadcast", nil)
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("User-Agent", c.userAgent)
+
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", err
+	}
+
+	if m := nwrFreqRe.FindSubmatch(body); m != nil {
+		return string(m[1]), nil
+	}
+	return "", nil
+}
+
+// HainesIndex fetches the current Haines Index value from the NWS gridpoints API.
+// Returns nil if unavailable (non-fatal).
+func (c *Client) HainesIndex(gp GridPoint) (*int, error) {
+	u := fmt.Sprintf("https://api.weather.gov/gridpoints/%s/%d,%d", gp.Office, gp.GridX, gp.GridY)
+
+	var r struct {
+		Properties struct {
+			HainesIndex struct {
+				Values []struct {
+					ValidTime string  `json:"validTime"`
+					Value     float64 `json:"value"`
+				} `json:"values"`
+			} `json:"hainesIndex"`
+		} `json:"properties"`
+	}
+	if err := c.getJSON(u, &r); err != nil {
+		return nil, err
+	}
+
+	now := time.Now()
+	for _, v := range r.Properties.HainesIndex.Values {
+		// validTime is an ISO 8601 interval: "2024-01-01T12:00:00+00:00/PT1H"
+		parts := strings.SplitN(v.ValidTime, "/", 2)
+		if len(parts) != 2 {
+			continue
+		}
+		start, err := time.Parse(time.RFC3339, parts[0])
+		if err != nil {
+			continue
+		}
+		dur, err := parseDuration(parts[1])
+		if err != nil {
+			continue
+		}
+		if now.After(start) && now.Before(start.Add(dur)) {
+			idx := int(math.Round(v.Value))
+			return &idx, nil
+		}
+	}
+	// If no interval matches exactly, return the first value as best estimate.
+	if len(r.Properties.HainesIndex.Values) > 0 {
+		idx := int(math.Round(r.Properties.HainesIndex.Values[0].Value))
+		return &idx, nil
+	}
+	return nil, nil
+}
+
+// parseDuration parses an ISO 8601 duration string (e.g. "PT1H", "PT6H", "P1D").
+func parseDuration(s string) (time.Duration, error) {
+	if len(s) < 2 || s[0] != 'P' {
+		return 0, fmt.Errorf("invalid duration: %s", s)
+	}
+	s = s[1:] // strip 'P'
+	var total time.Duration
+	inTime := false
+	for len(s) > 0 {
+		if s[0] == 'T' {
+			inTime = true
+			s = s[1:]
+			continue
+		}
+		// Read a number.
+		i := 0
+		for i < len(s) && (s[i] >= '0' && s[i] <= '9') {
+			i++
+		}
+		if i == 0 || i >= len(s) {
+			break
+		}
+		var n int
+		fmt.Sscanf(s[:i], "%d", &n)
+		unit := s[i]
+		s = s[i+1:]
+		switch unit {
+		case 'H':
+			total += time.Duration(n) * time.Hour
+		case 'M':
+			if inTime {
+				total += time.Duration(n) * time.Minute
+			} else {
+				total += time.Duration(n) * 30 * 24 * time.Hour // months approx
+			}
+		case 'D':
+			total += time.Duration(n) * 24 * time.Hour
+		}
+	}
+	return total, nil
+}
+
 // fetchResult is used for concurrent fetch operations.
 type fetchResult[T any] struct {
 	val T
@@ -454,6 +604,8 @@ func (c *Client) FetchAll(loc LocationInfo, gp GridPoint) (WeatherData, error) {
 	obsCh := make(chan fetchResult[Observation], 1)
 	alCh := make(chan fetchResult[[]Alert], 1)
 	zfCh := make(chan fetchResult[[]ZoneForecastPeriod], 1)
+	hiCh := make(chan fetchResult[*int], 1)
+	nwrFreqCh := make(chan fetchResult[string], 1)
 
 	go func() {
 		v, e := c.fetchPeriods(gp.ForecastURL)
@@ -475,12 +627,22 @@ func (c *Client) FetchAll(loc LocationInfo, gp GridPoint) (WeatherData, error) {
 		v, e := c.ZoneForecastText(gp.ForecastZoneURL)
 		zfCh <- fetchResult[[]ZoneForecastPeriod]{v, e}
 	}()
+	go func() {
+		v, e := c.HainesIndex(gp)
+		hiCh <- fetchResult[*int]{v, e}
+	}()
+	go func() {
+		v, e := c.NWRFrequency(gp.NWRTransmitter)
+		nwrFreqCh <- fetchResult[string]{v, e}
+	}()
 
 	fc := <-fcCh
 	h := <-hCh
 	obs := <-obsCh
 	al := <-alCh
 	zf := <-zfCh
+	hi := <-hiCh
+	nwrFreq := <-nwrFreqCh
 
 	if fc.err != nil {
 		return d, fmt.Errorf("forecast: %w", fc.err)
@@ -491,11 +653,15 @@ func (c *Client) FetchAll(loc LocationInfo, gp GridPoint) (WeatherData, error) {
 	if obs.err != nil {
 		return d, fmt.Errorf("observations: %w", obs.err)
 	}
-	// Alerts and zone forecast failures are non-fatal — continue without them.
+	// Alerts, zone forecast, Haines Index, and NWR frequency failures are non-fatal.
 	d.Forecast = fc.val
 	d.Hourly = h.val
 	d.Conditions = obs.val
 	d.Alerts = al.val
 	d.ZoneForecast = zf.val
+	d.HainesIndex = hi.val
+	if nwrFreq.val != "" {
+		d.GridPoint.NWRFrequency = nwrFreq.val
+	}
 	return d, nil
 }
