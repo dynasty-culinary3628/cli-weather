@@ -2,7 +2,7 @@
 # Edit this file to customize your weather display.
 
 # Your US ZIP code (required)
-zip_code = "10010"
+zip_code = "94087"
 
 # Units: "imperial" (°F, mph, inHg, mi) or "metric" (°C, km/h, hPa, km)
 units = "imperial"
